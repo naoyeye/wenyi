@@ -12,7 +12,7 @@ from typing import Any, Generic, TypeVar
 from pydantic import BaseModel
 
 from ...config import LLMConfig, TierConfig
-from ..base import LLMClient, Messages
+from ..base import LLMClient, Messages, ResponseTruncatedError
 from ..retrying import EmptyResponseError, RetryReporter, provider_retry
 from ..tiers import resolve_tier
 from ..usage import (
@@ -255,11 +255,12 @@ class OpenAICompatibleBaseClient(LLMClient, Generic[OptionsT]):
             message = choice.message
             raw_content = getattr(message, "content", None)
             content = raw_content if isinstance(raw_content, str) else ""
+            if str(getattr(choice, "finish_reason", "")).lower() == "length":
+                raise ResponseTruncatedError(
+                    f"{self.provider_name} response was truncated at the token limit "
+                    f"(model={tier_config.model}, tier={tier}, stage={stage or 'unknown'})"
+                )
             if not content.strip():
-                if str(getattr(choice, "finish_reason", "")).lower() == "length":
-                    raise RuntimeError(
-                        "OpenAI-compatible response was truncated at the token limit"
-                    )
                 fallback = self._json_response_fallback(tier_config, message) if json_mode else None
                 if fallback is None or not fallback.strip():
                     raise EmptyResponseError(f"{self.provider_name} response content is empty")
