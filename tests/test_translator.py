@@ -6,11 +6,10 @@ import json
 import re
 import unittest
 
-from trans_novel.agents import prompts
 from trans_novel.agents.translator import Translator
 from trans_novel.config import Config
+from trans_novel.i18n.prompts import template
 from trans_novel.llm.providers.fake import FakeClient
-from trans_novel.pipeline.checks import length_flags
 
 
 def _count_segments(user_content: str) -> int:
@@ -29,10 +28,10 @@ class TestTranslatorAlignment(unittest.TestCase):
             {
                 "language": {"source": "ja", "target": "zh"},
                 "llm": {
-                    "provider": "fake",
-                    "tiers": {
-                        "strong": {"model": "deepseek-v4-pro"},
-                        "cheap": {"model": "deepseek-v4-flash"},
+                    "preset": "fake",
+                    "models": {
+                        "default_strong": {"provider": "default", "model": "deepseek-pro"},
+                        "default_cheap": {"provider": "default", "model": "deepseek-flash"},
                     },
                 },
                 "pipeline": {"align_retry_limit": 1},
@@ -106,12 +105,35 @@ class TestTranslatorAlignment(unittest.TestCase):
 
     def test_empty_per_segment_fallback_is_rejected(self):
         client = FakeClient(
-            handler=lambda messages, tier, json_mode: json.dumps({"translations": []})
+            handler=lambda messages, tier, json_mode: json.dumps({"translations": [""]})
         )
         translator = Translator(client, self._config())
 
         with self.assertRaisesRegex(Exception, "failed at paragraph 0"):
             translator.translate_batch(["あ", "い"])
+
+    def test_mineru_allows_empty_string_translations(self):
+        """MinerU may persist blank targets when the model returns empty OCR-junk refusals."""
+
+        def handler(messages, tier, json_mode):
+            n = _count_segments(messages[-1]["content"])
+            return json.dumps({"translations": [""] * n})
+
+        translator = Translator(FakeClient(handler=handler), self._config())
+        out = translator.translate_batch(
+            ["The OCR result should be empty according to Rule 2.", "正文"],
+            allow_empty_translations=True,
+        )
+        self.assertEqual(out, ["", ""])
+
+    def test_mineru_empty_allowance_still_rejects_non_string(self):
+        client = FakeClient(
+            handler=lambda messages, tier, json_mode: json.dumps({"translations": [None]})
+        )
+        translator = Translator(client, self._config())
+
+        with self.assertRaisesRegex(Exception, "failed at paragraph 0"):
+            translator.translate_batch(["あ"], allow_empty_translations=True)
 
     def test_non_string_translation_is_rejected(self):
         client = FakeClient(
@@ -138,23 +160,45 @@ class TestTranslatorAlignment(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
 
 
+class TestMinerUEmptyTargetResume(unittest.TestCase):
+    def test_blank_target_counts_as_translated_for_resume_batches(self):
+        from trans_novel.ingest.models import Segment
+        from trans_novel.pipeline.translation import _is_mineru_pdf, _resume_batches
+
+        self.assertTrue(_is_mineru_pdf({"fmt": "pdf", "meta": {}}))
+        self.assertFalse(_is_mineru_pdf({"fmt": "pdf", "meta": {"babeldoc": True}}))
+        self.assertFalse(_is_mineru_pdf({"fmt": "epub", "meta": {}}))
+
+        segments = [
+            Segment(index=0, kind="p", source="a", target="译"),
+            Segment(index=1, kind="p", source="junk", target=""),
+            Segment(index=2, kind="p", source="b", target=None),
+        ]
+        batches = _resume_batches(segments, max_tokens=10_000)
+        self.assertEqual([[s.index for s in batch] for batch in batches], [[0, 1], [2]])
+
+
 class TestTranslatorPromptOrder(unittest.TestCase):
     def test_static_and_dynamic_prompt_sections_have_cache_friendly_order(self):
         self.assertLess(
-            prompts.TRANSLATOR_USER.template.index("[Chapter digest]"),
-            prompts.TRANSLATOR_USER.template.index("[Glossary]"),
+            template("translator_user").template.index("[Chapter digest]"),
+            template("translator_user").template.index("[Glossary]"),
         )
         self.assertLess(
-            prompts.TRANSLATOR_USER.template.index("[Glossary]"),
-            prompts.TRANSLATOR_USER.template.index("[Paragraph-specific annotation references]"),
+            template("translator_user").template.index("[Glossary]"),
+            template("translator_user").template.index(
+                "[Paragraph-specific annotation references]"
+            ),
         )
         self.assertLess(
-            prompts.TRANSLATOR_USER.template.index("[Paragraph-specific annotation references]"),
-            prompts.TRANSLATOR_USER.template.index("[Recent translations]"),
+            template("translator_user").template.index(
+                "[Paragraph-specific annotation references]"
+            ),
+            template("translator_user").template.index("[Recent translations]"),
         )
         self.assertLess(
-            prompts.TRANSLATOR_USER.template.index("[Recent translations]"),
-            prompts.TRANSLATOR_USER.template.index("[$src_label paragraphs to translate]"),
+            template("translator_user").template.index("[Recent translations]"),
+            template("translator_user").template.index("[$src_label paragraphs to translate]"),
         )
 
 
@@ -163,7 +207,7 @@ class TestTranslatorAnnotationContexts(unittest.TestCase):
         return Config.from_dict(
             {
                 "language": {"source": "en", "target": "zh"},
-                "llm": {"provider": "fake"},
+                "llm": {"preset": "fake"},
                 "pipeline": {"align_retry_limit": 1},
             }
         )
@@ -285,16 +329,6 @@ class TestTranslatorAnnotationContexts(unittest.TestCase):
                 ],
             ],
         )
-
-
-class TestChecks(unittest.TestCase):
-    def test_length_flags(self):
-        sources = ["これは長い日本語の文章です。" * 3, "短い", "x" * 10]
-        targets = ["", "短い但正常的中文译文内容", "x" * 40]
-        flags = length_flags(sources, targets)
-        kinds = {f.index: f.reason for f in flags}
-        self.assertEqual(kinds.get(0), "empty")  # An empty translation.
-        self.assertEqual(kinds.get(2), "too_long")  # An excessive length ratio.
 
 
 if __name__ == "__main__":

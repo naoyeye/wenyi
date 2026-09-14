@@ -10,27 +10,33 @@ import os
 import sys
 from collections.abc import Sequence
 from importlib.metadata import version as package_version
-from typing import Any, Protocol
+from typing import Any
 
 import typer
 import yaml
+from rich.cells import cell_len, set_cell_size
 from rich.console import Console
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
     Progress,
+    ProgressColumn,
     SpinnerColumn,
+    Task,
     TextColumn,
     TimeElapsedColumn,
 )
-from rich.table import Table
+from rich.table import Column, Table
+from rich.text import Text
 from typer.core import TyperGroup
 
 from .config import Config
 from .i18n.languages import validate_run_languages
 from .ingest.errors import IngestError
 from .ingest.segmenter import load_document
+from .model_commands import register_model_commands
 from .pipeline.runstore import STATUS_DONE, RunStore, translation_run_dir
+from .timing import format_duration, load_timing
 
 
 def _configure_windows_console(
@@ -55,13 +61,6 @@ def _configure_windows_console(
 _configure_windows_console()
 
 _CONFIG: dict[str, Any] = {"path": "config.yaml", "skip_api_check": False}
-_API_CHECK_EXEMPT_COMMANDS = {
-    "languages",
-    "assemble",
-    "glossary",
-    "report",
-    "status",
-}
 
 
 def _config_path_from_args(args: Sequence[str]) -> str:
@@ -93,7 +92,13 @@ class _ConfigInitializingGroup(TyperGroup):
         _CONFIG["path"] = config_path
         _CONFIG["skip_api_check"] = any(arg in {"--help", "-h"} for arg in cli_args)
         Config.create_default_file(config_path)
-        return super().main(*main_args, args=args, **main_kwargs)
+        from .llm.limits import RequestStopped
+
+        try:
+            return super().main(*main_args, args=args, **main_kwargs)
+        except RequestStopped as error:
+            typer.echo(f"Stopped: {error}", err=True)
+            raise SystemExit(1) from None
 
 
 app = typer.Typer(
@@ -109,28 +114,81 @@ glossary_app = typer.Typer(
 )
 console = Console()
 
+_PROGRESS_DESCRIPTION_WIDTH = 28
+
+
+def _short_progress_description(label: str) -> str:
+    """Truncate long titles by terminal cell width and keep an ellipsis when clipped."""
+    if cell_len(label) <= _PROGRESS_DESCRIPTION_WIDTH:
+        return label
+    prefix = set_cell_size(label, _PROGRESS_DESCRIPTION_WIDTH - 1).rstrip()
+    return f"{prefix}…"
+
+
+class _WorkflowElapsedColumn(TimeElapsedColumn):
+    """Keep elapsed time advancing across stages, including completed-stage waits."""
+
+    def render(self, task: Task) -> Text:
+        started = task.fields.get("workflow_started", task.start_time)
+        elapsed = 0.0 if started is None else task.get_time() - started
+        return Text(format_duration(elapsed), style="progress.elapsed")
+
+
+def _progress_columns() -> tuple[ProgressColumn, ...]:
+    """Build Rich columns that keep long stage names from hiding the bar."""
+    description_column = Column(
+        max_width=_PROGRESS_DESCRIPTION_WIDTH,
+        no_wrap=True,
+        overflow="ellipsis",
+    )
+    return (
+        SpinnerColumn(),
+        TextColumn(
+            "[progress.description]{task.description}",
+            table_column=description_column,
+        ),
+        BarColumn(),
+        MofNCompleteColumn(),
+        _WorkflowElapsedColumn(),
+    )
+
 
 class _RichProgressBridge:
     """Map pipeline stage progress onto one Rich task."""
 
     def __init__(self, progress: Progress, initial_description: str) -> None:
         self.progress = progress
-        self.task = progress.add_task(initial_description, total=None)
+        self._started = progress.get_time()
+        self.task = progress.add_task(
+            _short_progress_description(initial_description),
+            total=None,
+            workflow_started=self._started,
+        )
+        self._stage: tuple[str, int | None] = (initial_description, None)
 
     def __call__(self, done: int, total: int, label: str) -> None:
         """Refresh the current stage and counts without accumulating progress bars."""
+        stage = (label, total if total > 0 else None)
+        short = _short_progress_description(label)
         if total > 0:
+            if stage != self._stage:
+                # A completed Rich task retains its finished time until reset.
+                self.progress.reset(self.task, total=total, completed=done, description=short)
+            self._stage = stage
             self.progress.update(
                 self.task,
                 completed=done,
                 total=total,
-                description=label,
+                description=short,
             )
+            return
+        if stage == self._stage:
             return
         # Rich update(total=None) leaves the total unchanged. Recreate the task
         # to restore indeterminate progress and clear the previous stage’s counts.
         self.progress.remove_task(self.task)
-        self.task = self.progress.add_task(label, total=None)
+        self.task = self.progress.add_task(short, total=None, workflow_started=self._started)
+        self._stage = stage
 
 
 def _version_callback(value: bool) -> None:
@@ -138,12 +196,6 @@ def _version_callback(value: bool) -> None:
     if value:
         console.print(package_version("trans-novel"))
         raise typer.Exit()
-
-
-class _ManifestStore(Protocol):
-    def load_manifest(self) -> dict[str, Any]:
-        """Return manifest data from the run directory."""
-        ...
 
 
 @app.callback()
@@ -163,23 +215,9 @@ def _root(
         help="Show the version and exit",
     ),
 ):
-    """Record the config path and validate model credentials before dispatch."""
+    """Record the config path; workflow commands validate credentials after their overrides."""
     del version
     _CONFIG["path"] = config
-    command = ctx.invoked_subcommand
-    should_validate = (
-        not _CONFIG.get("skip_api_check")
-        and command is not None
-        and command not in _API_CHECK_EXEMPT_COMMANDS
-    )
-    if should_validate:
-        try:
-            _validate_api_configuration()
-        except typer.Exit:
-            raise
-        except (OSError, RuntimeError, ValueError) as error:
-            console.print(f"[red]Error: {error}[/]")
-            raise typer.Exit(1) from None
 
 
 def _load_config() -> Config:
@@ -191,11 +229,20 @@ def _load_config() -> Config:
         raise typer.Exit(1) from None
 
 
-def _validate_api_configuration() -> None:
-    """Build the provider and validate its API credentials before command execution."""
+def _validate_api_configuration(config: Config, workflow: str) -> None:
+    """Validate only the connections reachable after command-line overrides."""
     from .llm.factory import build_client
+    from .llm.operations import configured_operations
 
-    build_client(_load_config()).validate_credentials()
+    if not _CONFIG.get("skip_api_check"):
+        try:
+            build_client(config).validate_credentials(configured_operations(config, workflow))
+        except (ValueError, RuntimeError) as error:
+            console.print(f"[red]Error: {error}[/]")
+            raise typer.Exit(1) from None
+
+
+register_model_commands(app, _load_config, console)
 
 
 def _require_input_file(input_path: str) -> None:
@@ -217,10 +264,12 @@ def _validate_output_format(fmt: str) -> str:
     return normalized
 
 
-def _resolve_output_format(input_path: str, fmt: str | None) -> str:
-    """Default to DOCX for .docx input and EPUB otherwise when --format is absent."""
+def _resolve_output_format(input_path: str, fmt: str | None) -> str | None:
+    """Defer PDF defaults to saved backend metadata; keep DOCX and EPUB defaults."""
     if fmt is not None and str(fmt).strip():
         return _validate_output_format(str(fmt))
+    if os.path.splitext(input_path)[1].lower() == ".pdf":
+        return None
     if os.path.splitext(input_path)[1].lower() == ".docx":
         return "docx"
     return "epub"
@@ -262,18 +311,6 @@ def _runstore_for_cli(config: Config, input_path: str) -> RunStore:
         raise typer.Exit(1) from None
 
 
-def _apply_store_languages(config: Config, store: _ManifestStore) -> None:
-    """Restore the run’s source and target languages for standalone stages."""
-    manifest = store.load_manifest()
-    validate_run_languages(manifest, config.source_lang, config.target_lang)
-    source_lang = manifest.get("source_lang")
-    target_lang = manifest.get("target_lang")
-    if isinstance(source_lang, str) and source_lang:
-        config.source_lang = source_lang
-    if isinstance(target_lang, str) and target_lang:
-        config.target_lang = target_lang
-
-
 def _translate_impl(
     input_path: str,
     *,
@@ -299,7 +336,9 @@ def _translate_impl(
             mono=mono,
             bilingual=bilingual,
         )
-    except (IngestError, ImportError, OSError, ValueError) as error:
+    except typer.Exit:
+        raise
+    except (IngestError, ImportError, OSError, ValueError, RuntimeError) as error:
         console.print(f"[red]Error: {error}[/]")
         raise typer.Exit(1) from None
 
@@ -331,17 +370,15 @@ def _translate_srt_or_raise(
         raise ValueError("SRT translation does not support: " + ", ".join(ignored))
 
     config = _load_config()
+    _validate_api_configuration(config, "srt")
+    _require_input_file(input_path)
     if mono is not None:
         config.output.mono = mono
     if bilingual is not None:
         config.output.bilingual = bilingual
 
     with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
+        *_progress_columns(),
         console=console,
     ) as prog:
         cb = _RichProgressBridge(prog, "Translating subtitles…")
@@ -359,6 +396,7 @@ def _translate_srt_or_raise(
         f"State directory: {result['run_dir']}"
     )
     _print_usage({"usage": result.get("usage") or {}})
+    _print_timing(result["run_dir"])
     for path in result.get("outputs") or []:
         console.print(f"Translation: [bold]{path}[/]")
 
@@ -378,7 +416,6 @@ def _translate_impl_or_raise(
     """Run translation; let ``_translate_impl`` convert exceptions to CLI errors."""
     from .pipeline.orchestrator import Orchestrator
 
-    _require_input_file(input_path)
     if os.path.splitext(input_path)[1].lower() == ".srt":
         _translate_srt_or_raise(
             input_path,
@@ -405,7 +442,7 @@ def _translate_impl_or_raise(
         config.output.bilingual = bilingual
     if chapter is not None:
         ignored: list[str] = []
-        if fmt != "epub":
+        if fmt not in {None, "epub"}:
             ignored.append("--format")
         if out is not None:
             ignored.append("--out")
@@ -421,16 +458,19 @@ def _translate_impl_or_raise(
                 + ", ".join(ignored)
             )
 
+    if chapter is not None:
+        config.pipeline.review = False
+    _validate_api_configuration(config, "translate")
+    _require_input_file(input_path)
     orch = Orchestrator(config)
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as prog:
+    with (
+        orch.client.interrupt_scope(),
+        Progress(
+            *_progress_columns(),
+            console=console,
+        ) as prog,
+    ):
         cb = _RichProgressBridge(prog, "Preparing…")
 
         if chapter is not None:
@@ -443,6 +483,7 @@ def _translate_impl_or_raise(
                 f"[green]Translated chapter {chapter}[/], State directory: {store.run_dir}"
             )
             _print_usage({"usage": store.load_usage() or {}})
+            _print_timing(store.run_dir)
             return
 
         result = orch.run_all(
@@ -458,6 +499,7 @@ def _translate_impl_or_raise(
         f"[bold green]Complete[/]: {s['chapters_done']}/{s['chapters_total']} chapters, terms: {s['terms']}."
     )
     _print_usage({"usage": result["store"].load_usage() or {}})
+    _print_timing(result["store"].run_dir)
     for path in result.get("outputs") or [result["output"]]:
         console.print(f"Translation: [bold]{path}[/]")
     if result.get("review_dir"):
@@ -476,30 +518,22 @@ def _prepare_impl(input_path: str) -> None:
     from .pipeline.orchestrator import Orchestrator
 
     try:
-        _require_input_file(input_path)
         config = _load_config()
+        _validate_api_configuration(config, "prepare")
+        _require_input_file(input_path)
         orch = Orchestrator(config)
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as prog:
-            task = prog.add_task("Preparing…", total=None)
-
-            def cb(done: int, total: int, label: str) -> None:
-                """Synchronize preparation progress with the Rich task."""
-                nonlocal task
-                if total > 0:
-                    prog.update(task, completed=done, total=total, description=label)
-                    return
-                prog.remove_task(task)
-                task = prog.add_task(label, total=None)
-
+        with (
+            orch.client.interrupt_scope(),
+            Progress(
+                *_progress_columns(),
+                console=console,
+            ) as prog,
+        ):
+            cb = _RichProgressBridge(prog, "Preparing…")
             store = orch.prepare_for_translation(input_path, progress=cb)
-    except (IngestError, ImportError, OSError, ValueError) as error:
+    except typer.Exit:
+        raise
+    except (IngestError, ImportError, OSError, ValueError, RuntimeError) as error:
         console.print(f"[red]Error: {error}[/]")
         raise typer.Exit(1) from None
 
@@ -517,6 +551,22 @@ def _prepare_impl(input_path: str) -> None:
     console.print(f"State directory: [bold]{store.run_dir}[/]")
     console.print("Run translate with the same source file to continue the full translation.")
     _print_usage({"usage": store.load_usage() or {}})
+    _print_timing(store.run_dir)
+
+
+def _print_timing(run_dir: str) -> None:
+    """Show the last invocation and accumulated execution time, including failed runs."""
+    timing = load_timing(run_dir)
+    if timing is None:
+        return
+    last = timing["runs"][-1]
+    count = len(timing["runs"])
+    console.print(
+        f"Time: last run {format_duration(last['elapsed_seconds'])} ({last['status']}), "
+        f"cumulative {format_duration(timing['total_seconds'])} across {count} "
+        f"{'run' if count == 1 else 'runs'}.",
+        highlight=False,
+    )
 
 
 def _print_usage(report: dict) -> None:
@@ -546,6 +596,10 @@ def _print_usage(report: dict) -> None:
             f"{v['calls']} calls, cache hit rate {v['cache_hit_rate']:.1%}"
         )
 
+    for identity, value in sorted((usage.get("by_model") or {}).items()):
+        label = (usage.get("labels") or {}).get(identity, identity)
+        console.print(f"  · Model {label}: {value['total_tokens']:,} tok, {value['calls']} calls")
+
 
 # ── Complete workflow / Preparation ────────────────────────────────────────────────
 @app.command(rich_help_panel="Main workflow")
@@ -563,7 +617,7 @@ def translate(
     fmt: str | None = typer.Option(
         None,
         "--format",
-        help="Output format: epub / txt / html / markdown / pdf / docx; default: docx for .docx input, epub otherwise",
+        help="Output format: epub / txt / html / markdown / pdf / docx; default: pdf for BabelDOC PDF state, docx for .docx input, epub otherwise",
     ),
     out: str | None = typer.Option(
         None,
@@ -633,24 +687,26 @@ def review(
     """Run evidence review, shadow revisions and blind rechecks, with optional autofix."""
     from .pipeline.orchestrator import Orchestrator
 
-    _require_input_file(input)
-    config = _load_config()
-    if autofix is not None:
-        config.pipeline.review_autofix = autofix
-    orch = Orchestrator(config)
-
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as prog:
+        config = _load_config()
+        if autofix is not None:
+            config.pipeline.review_autofix = autofix
+        _validate_api_configuration(config, "review")
+        _require_input_file(input)
+        orch = Orchestrator(config)
+
+        with (
+            orch.client.interrupt_scope(),
+            Progress(
+                *_progress_columns(),
+                console=console,
+            ) as prog,
+        ):
             cb = _RichProgressBridge(prog, "Preparing whole-book review…")
             result = orch.run_review(input, progress=cb)
-    except (IngestError, ImportError, OSError, ValueError) as error:
+    except typer.Exit:
+        raise
+    except (IngestError, ImportError, OSError, ValueError, RuntimeError) as error:
         console.print(f"[red]Error: {error}[/]")
         raise typer.Exit(1) from None
 
@@ -672,6 +728,7 @@ def review(
             "Review produced recommendations only; formal chapter translations are unchanged."
         )
     console.print(f"Review directory: {result['review_dir']}")
+    _print_timing(result["store"].run_dir)
 
 
 # ── Inspection / Individual stages ──────────────────────────────────────────────────────
@@ -717,6 +774,7 @@ def status(
     g = GlossaryStore(store.glossary_path)
     console.print("Glossary: ", g.stats())
     g.close()
+    _print_timing(store.run_dir)
 
 
 @glossary_app.command("list")
@@ -812,7 +870,7 @@ def assemble(
     fmt: str | None = typer.Option(
         None,
         "--format",
-        help="Output format: epub / txt / html / markdown / pdf / docx; default: docx for .docx input, epub otherwise",
+        help="Output format: epub / txt / html / markdown / pdf / docx; default: pdf for BabelDOC PDF state, docx for .docx input, epub otherwise",
     ),
     pdf_engine: str = typer.Option(
         "weasyprint",
@@ -853,6 +911,7 @@ def assemble(
         console.print(f"[red]Error: {error}[/]")
         raise typer.Exit(1) from None
     paths = result["outputs"]
+    _print_timing(result["store"].run_dir)
     for path in paths:
         console.print(f"Translation written: [bold]{path}[/]")
 
