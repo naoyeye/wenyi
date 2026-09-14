@@ -18,6 +18,16 @@ release version; development builds include their commit distance and hash.
 
 Whenever the program starts, it checks for `config.yaml` in the current directory and creates a documented default file when it is missing. Review the model settings before starting a real translation.
 
+## Inspect model routing
+
+```bash
+uv run trans-novel models list
+uv run trans-novel models explain --operation review.fix
+uv run trans-novel models check --for translate
+```
+
+These commands preview routes and check credentials locally without requests. Keep the three default tiers or select models independently through `llm.routes`. See [configuration](configuration.md#models-and-operation-routing) for explicit config/usage conversion, budgets and `models compare`.
+
 ## Multilingual translation (experimental)
 
 Run `uv run trans-novel languages` to list built-in languages. Use this fragment in your configuration, retaining your existing model settings, for direct Chinese-to-English translation:
@@ -34,7 +44,7 @@ uv run trans-novel --config config.yaml translate book.epub --bilingual
 
 Outputs are `output/book.en.epub` and `output/book.en-bi.epub`. For Japanese-to-English use `source: ja`, `target: en`; for English-to-Japanese use `source: en`, `target: ja`. A reverse run takes a file in the corresponding source language; each run selects one direction. Explicit `--out` names and their `-bi` derivatives retain their existing behavior.
 
-The `.zh.*` and `state/<book>/` examples below describe the default Simplified Chinese target. Other new targets use their language suffix and `state/<book>/targets/<target-language>/`; subtitles use `state/srt/<slug>/targets/<target-language>/`. See [configuration](configuration.md#languages) for legacy directory compatibility. Resume and standalone stages use the same target configuration; switching back does not retranslate completed work. The EPUB about page is Chinese for Simplified Chinese targets and otherwise temporarily falls back to an English page tagged as English; disable it with `about_page: false`.
+The `.zh.*` examples below describe the default Simplified Chinese target. All book targets use `state/<book>/targets/<target-language>/`; subtitles use `state/srt/<slug>/targets/<target-language>/`. Resume and standalone stages use the same target configuration; switching back does not retranslate completed work. The EPUB about page is Chinese for Simplified Chinese targets and otherwise temporarily falls back to an English page tagged as English; disable it with `about_page: false`.
 
 The CLI uses English for help, progress, tables, and errors. Translation and generated descriptive metadata follow `language.target`; original names in `source` and `aliases` remain available for matching. Existing analysis and glossary notes are reused when resuming and are not automatically translated by this update. This version does not support RTL targets such as Arabic or Hebrew. PDF fonts and external bridge language capabilities require separate validation. Real-model long-form before/after quality evaluation remains outstanding.
 
@@ -91,12 +101,12 @@ checksum, approve it in **System Settings → Privacy & Security** if prompted.
 ## Input and output
 
 - Input formats: EPUB, FB2, TXT, Markdown, HTML, PDF, DOCX, and SRT.
-- Default book output: a monolingual `<book-name>.zh.epub` under the source file's `output/` directory (`.docx` inputs default to `<book-name>.zh.docx` instead). The bilingual `*.zh-bi.*` edition is optional.
-- `--format epub|txt|html|markdown|pdf|docx`: export the selected format for book inputs. When omitted, `.docx` → `docx` and other books → `epub`. This flag does not apply to SRT.
+- Default book output: a monolingual `<book-name>.zh.epub` under the source file's `output/` directory (`.docx` inputs default to `<book-name>.zh.docx`, and BabelDOC PDF state defaults to `<book-name>.zh.pdf`). The bilingual `*.zh-bi.*` edition is optional.
+- `--format epub|txt|html|markdown|pdf|docx`: export the selected format for book inputs. When omitted, BabelDOC PDF state → `pdf`, `.docx` → `docx`, and other books (including MinerU PDF state) → `epub`. An explicit format always takes precedence; PDF defaults follow the saved backend, even if the current `pdf_backend` setting has changed. This flag does not apply to SRT.
 - For EPUB input, Wenyi attempts to write translated text back into the original XHTML templates while preserving styles, images, the table of contents, and anchors.
 - The bilingual edition displays the translation and source text together. The source is visually subdued by default; set `output.bilingual_preserve_source_style: true` to inherit the book's normal text style. Their order is controlled by `output.bilingual_order`.
 - EPUB output includes an “About this translation” page by default. Set `output.about_page: false` to disable it.
-- Book runtime data is stored under `state/<book>/`, including chapter intermediates, the SQLite glossary, usage data, and reports. Subtitle runs use a separate tree under `state/srt/` (see [SRT subtitles](#srt-subtitles)).
+- Book runtime data is stored under `state/<book>/targets/<target-language>/`, including chapter intermediates, the SQLite glossary, usage data, and reports. Subtitle runs use a separate tree under `state/srt/` (see [SRT subtitles](#srt-subtitles)).
 
 ### Experimental PDF support
 
@@ -104,12 +114,11 @@ PDF input and PDF output are both experimental.
 
 #### PDF input
 
-Default backend is BabelDOC, which preserves layout through the external
-**BabelDOC bridge** (AGPL, separate repo/process, HTTP only). Use MinerU for
-scanned pages that have no extractable text layer.
+Default backend is MinerU. For layout-preserving export, use the external
+**BabelDOC bridge** (AGPL, separate repo/process, HTTP only):
 
 1. Install/start `wenyi-babeldoc-bridge` (default `http://127.0.0.1:8765`)
-2. The default `config.yaml` already selects BabelDOC:
+2. In `config.yaml`:
 
 ```yaml
 pipeline:
@@ -118,14 +127,7 @@ pipeline:
   # babeldoc_pages: "15"   # optional, 1-based
 ```
 
-To use MinerU instead:
-
-```yaml
-pipeline:
-  pdf_backend: mineru
-```
-
-3. After `translate book.pdf`, `assemble --format pdf` calls bridge `/fillback`.
+3. `translate book.pdf` automatically exports PDF through bridge `/fillback`. Later, `assemble book.pdf` also defaults to PDF for that saved BabelDOC state; `--format pdf` is optional. Use an explicit `--format` to select another format.
    The fillback PDF omits BabelDOC layout overlay boxes and role labels
    such as ``plain text`` / ``title`` by default.
    The bridge freezes the post-extraction IL as a durable session snapshot. It can
@@ -137,9 +139,8 @@ pipeline:
    keep `meta.babeldoc_id` for fillback. Books without outlines fall back to one chapter.
 
 BabelDOC is intended for PDFs with an extractable text layer. Before contacting the
-bridge, Wenyi checks the selected pages and stops with a suggestion to switch to
-MinerU (`pipeline.pdf_backend: mineru`) or run OCR first when it finds only scanned
-images and no text layer.
+bridge, Wenyi checks the selected pages and stops with a suggestion to use the default
+MinerU backend or run OCR first when it finds only scanned images and no text layer.
 
 The first MinerU PDF import requires `MINERU_API_KEY`:
 
@@ -149,7 +150,7 @@ uv run trans-novel translate book.pdf
 ```
 
 MinerU's converted HTML is saved at
-`state/<book>/source/<source-sha256>/converted.html`. The content-addressed
+`state/<book>/targets/<target-language>/source/<source-sha256>/converted.html`. The content-addressed
 directory prevents an interrupted run from reusing another PDF's conversion.
 Later runs reuse this file, and you may correct it manually before resuming.
 
@@ -178,7 +179,7 @@ TTC font file. This option also works on Windows.
 
 ## DOCX (Word)
 
-`translate book.docx` uses the full book Orchestrator (glossary, polish, review, resume under `state/<slug>/`).
+`translate book.docx` uses the full book Orchestrator (glossary, polish, review, resume under `state/<slug>/targets/<target-language>/`).
 
 **Structure**
 
@@ -223,14 +224,15 @@ uv run trans-novel translate movie.srt --no-mono --bilingual
 ```
 
 Resume by running the same source file again. Cached batches under
-`state/srt/<slug>/batches/` are skipped. Layout:
+`state/srt/<slug>/targets/<target-language>/batches/` are skipped. Layout:
 
 ```text
-state/srt/<slug>/
+state/srt/<slug>/targets/<target-language>/
   manifest.json    # source identity, cue counts, window settings
   cues.jsonl       # one cue per line: index, timestamp, source, target, status
   batches/         # raw model results for resume
   usage.json       # cumulative token usage across resumes
+  timing.json      # cumulative execution time and individual invocation durations
   events.jsonl     # run events and LLM retry observations
 ```
 
@@ -238,26 +240,31 @@ There is no `glossary.db` or `reviews/` tree for subtitles. Package code lives i
 `trans_novel.srt` (store + translate), with I/O in `ingest.srt_reader` and
 `assemble.srt_writer`.
 
-## Per-run metrics
+## Usage and event logs
 
-`state/<book>/usage.json` remains the cumulative token total for the book.
-`translate`, `prepare`, `review`, `assemble`, and `report` each write an independent
-`state/<book>/run_metrics/<run-id>.json` record with:
+Each target directory stores cumulative token usage in `usage.json` and appends stage events and retries to `events.jsonl`. Review directories also record session usage; each increment is merged into the cumulative ledger once.
 
-- the input SHA-256, configuration, package, and Git revision fingerprints;
-- invocation options such as a selected chapter, output format, and PDF engine;
-- requested stages, completion or failure status, and per-stage wall time;
-- only the LLM calls and tokens added by that invocation; and
-- ending chapter and segment completion counts.
+The progress-bar clock measures the entire current workflow, including parsing, model
+waits, translation, polishing, review and export. Switching stages, chapters or review
+rounds does not reset it; completing one stage does not stop it while subsequent work
+is pending. Concurrent model requests contribute wall time, not the sum of request durations.
 
-Every resume creates a new record, so clean runs from different branches can be
-compared without mixing their costs. Records omit the full source path and book
-text, redact sensitive option values, and store only an exception type on
-failure.
+After `prepare`, `translate` (including `--chapter` and SRT), `review` or `assemble`,
+the CLI prints the last run's duration and cumulative execution time. Each target's
+`timing.json` stores `total_seconds` and a `runs` list with invocation IDs, operations,
+timestamps, durations and completion statuses. Repeating a command adds only that
+invocation's execution time, excluding downtime between runs; nested pipeline stages
+are counted once. Separately launched commands contribute their own durations, even
+when they overlap. Book timing can also be inspected with `trans-novel status book.epub`;
+inspection and report regeneration do not add time.
 
-New manifests store `source_sha256` instead of an absolute source path. Wenyi
-rejects a same-title state directory when its recorded hash does not match the
-current input. Manifests created by older versions must be rebuilt.
+Once book state has been initialized or validated, failures and normal Ctrl+C exits
+also save the invocation's elapsed time. Timing is committed atomically under its own
+lock, independently of token usage. Older runs have no timing history to recover;
+time is accumulated from this version onward. A forced kill or a failure before state
+initialization cannot save the current invocation's duration.
+
+Manifests bind input content with `source_sha256`. A different file with the same name, or state without a valid hash, cannot resume; create new translation state.
 
 ## Common commands
 
@@ -292,9 +299,11 @@ uv run trans-novel status book.epub
 
 Changing polishing settings does not automatically rerun translation batches that
 are already complete. Review can reuse a completed result or resume an interrupted
-run marked `running` when translation content, review configuration, and glossary
+run marked `running` or `interrupted` when translation content, review configuration, and glossary
 fingerprints match. A run marked `failed` starts a new review rather than resuming
-its checkpoint. Runs are read-only by default; `--autofix` may publish their final revisions.
+its checkpoint. Recoverable provider failures, such as quota, timeout, and transport
+errors, are recorded as `interrupted`; exhausted review output recovery remains a failure.
+Runs are read-only by default; `--autofix` may publish their final revisions.
 
 If the initial Reviewer response reaches the token limit, review recursively splits
 the affected block and retries smaller blocks. Single-paragraph failures use the
@@ -331,7 +340,7 @@ written only to chapter `target`; no Review history fields are added to chapter
 JSON, and the manifest and glossary are unchanged. Each run writes one user-facing
 `result.json`, its model-usage
 delta, an event stream, and internal round traces to
-`state/<book>/reviews/review-<timestamp>/`. The same usage delta is also added once
+`state/<book>/targets/<target-language>/reviews/review-<timestamp>/`. The same usage delta is also added once
 to the book's cumulative `usage.json`. Autofix keeps its full before/after chain,
 issue decisions, failures, and idempotent write journal in `autofix/index.json`;
 annotation and DOCX style offsets are refreshed after publishing. `report.json`

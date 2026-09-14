@@ -22,6 +22,8 @@ from tenacity import (
 
 _LOGGER = logging.getLogger(__name__)
 _RETRYABLE_STATUS_CODES = {408, 409, 429}
+# Provider stops that should leave Review resumable even when automatic retry gives up.
+_RESUMABLE_INTERRUPT_STATUS_CODES = frozenset({402, 408, 409, 429})
 _MAX_WAIT_SECONDS = 30.0
 _FALLBACK_WAIT = wait_random_exponential(multiplier=1, max=_MAX_WAIT_SECONDS)
 
@@ -147,6 +149,24 @@ def is_retryable_provider_error(error: Any) -> bool:
     return retry_reason(error) is not None
 
 
+def is_resumable_provider_interrupt(error: Any) -> bool:
+    """Return True when a provider failure should keep long Review runs resumable.
+
+    Covers automatic-retry cases plus payment/quota stops such as HTTP 402. Permanent
+    local configuration and certificate errors stay False so Review can still finish as
+    failed.
+    """
+    if is_retryable_provider_error(error):
+        return True
+    status_code = error_status_code(error)
+    if status_code is not None and (
+        status_code in _RESUMABLE_INTERRUPT_STATUS_CODES or status_code >= 500
+    ):
+        return True
+    message = str(error).lower()
+    return "insufficient balance" in message or "insufficient_quota" in message
+
+
 def _retry_after_seconds(error: Any) -> float | None:
     """Parse Retry-After/retry-after-ms and cap the wait at a safe upper bound."""
     milliseconds = _header(error, "retry-after-ms")
@@ -270,7 +290,7 @@ class RetryReporter:
         )
 
 
-def provider_retry(max_retries: int, reporter: RetryReporter):
+def provider_retry(max_retries: int, reporter: RetryReporter, *, sleep=None):
     """Build the selective retry decorator shared by remote providers."""
 
     def exhausted(retry_state: RetryCallState):
@@ -287,6 +307,7 @@ def provider_retry(max_retries: int, reporter: RetryReporter):
         retry=retry_if_exception(is_retryable_provider_error),
         before_sleep=reporter.before_sleep,
         retry_error_callback=exhausted,
+        **({"sleep": sleep} if sleep is not None else {}),
     )
 
 
@@ -294,6 +315,7 @@ __all__ = [
     "EmptyResponseError",
     "RetryReporter",
     "error_status_code",
+    "is_resumable_provider_interrupt",
     "is_retryable_provider_error",
     "provider_retry",
     "retry_reason",

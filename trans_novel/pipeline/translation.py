@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..glossary.extractor import TranslatedSegmentEvidence
 from ..glossary.store import GlossaryStore
+from ..i18n.prompts import render
 from ..ingest.epub_reader import strip_ruby_markers
 from ..ingest.models import Segment
 from ..ingest.segmenter import batch_segments
@@ -30,18 +31,27 @@ if TYPE_CHECKING:
 ProgressFn = Callable[[int, int, str], None]
 
 
-def _resume_batches(segments, max_chars: int) -> list[list]:
-    """Split character-budget batches again at completed/pending boundaries.
-    A changed budget may mix saved translations and empty targets in one batch. Group by
+def _is_mineru_pdf(manifest: dict[str, Any]) -> bool:
+    """True for MinerU PDF state (fmt=pdf without BabelDOC markers)."""
+    if manifest.get("fmt") != "pdf":
+        return False
+    raw_meta = manifest.get("meta")
+    meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
+    return not bool(meta.get("babeldoc")) and meta.get("pdf_export") != "babeldoc"
+
+
+def _resume_batches(segments, max_tokens: int) -> list[list]:
+    """Split token-budget batches again at completed/pending boundaries.
+    A changed budget may mix saved translations and unset targets in one batch. Group by
     completion state to translate only missing paragraphs and avoid overwriting confirmed
-    content.
+    content. ``target is not None`` (including blank ``""``) counts as translated.
     """
     batches: list[list] = []
-    for raw_batch in batch_segments(segments, max_chars):
+    for raw_batch in batch_segments(segments, max_tokens):
         current: list = []
         current_done: bool | None = None
         for segment in raw_batch:
-            done = bool(segment.target and segment.target.strip())
+            done = segment.target is not None
             if current and done != current_done:
                 batches.append(current)
                 current = []
@@ -79,6 +89,7 @@ class TranslationService:
             min_recent_keep=max(40, self._runtime.config.pipeline.rolling_context_segments),
         )
         style = self._runtime.analyzer.style_brief(store.load_analysis() or {})
+        allow_empty_translations = _is_mineru_pdf(manifest)
 
         if only_chapter is not None:
             targets = [only_chapter]
@@ -95,29 +106,30 @@ class TranslationService:
             only_chapter=only_chapter,
             chapters=targets,
             total_segments=total,
+            allow_empty_translations=allow_empty_translations,
         )
         try:
-            with self._runtime.metric_stage("translate"):
-                for ci in targets:
-                    done = self.translate_chapter(
-                        ci,
-                        store,
-                        glossary,
-                        context,
-                        style,
-                        book_synopsis,
-                        translation_history=translation_history,
-                        source_corpus=source_corpus,
-                        annotation_context_registry=annotation_context_registry,
-                        progress=progress,
-                        done=done,
-                        total=total,
-                    )
-                    store.save_context(context.to_dict())
-                    self._runtime.flush_usage(store, scope="chapter")
-                # Translate chapter/TOC titles after the body; keep the original book title and use glossary names.
-                if not store.pending_chapters():
-                    self.translate_titles(store, glossary, progress=progress)
+            for ci in targets:
+                done = self.translate_chapter(
+                    ci,
+                    store,
+                    glossary,
+                    context,
+                    style,
+                    book_synopsis,
+                    translation_history=translation_history,
+                    source_corpus=source_corpus,
+                    annotation_context_registry=annotation_context_registry,
+                    progress=progress,
+                    done=done,
+                    total=total,
+                    allow_empty_translations=allow_empty_translations,
+                )
+                store.save_context(context.to_dict())
+                self._runtime.flush_usage(store, scope="chapter")
+            # Translate chapter/TOC titles after the body; keep the original book title and use glossary names.
+            if not store.pending_chapters():
+                self.translate_titles(store, glossary, progress=progress)
         finally:
             glossary.close()
             self._runtime.flush_usage(store, scope="translate")
@@ -179,8 +191,8 @@ class TranslationService:
     def progress_counts(self, store: RunStore, chapter_indices: list[int]) -> tuple[int, int]:
         """Compute progress from batch checkpoints, starting resume at completed translation
         counts.
-        Count a batch as done only when all its targets exist. Counting partial batches
-        early would duplicate completion counts if the batch reruns.
+        Count a batch as done only when every target is not None (blank ``""`` counts). Counting
+        partial batches early would duplicate completion counts if the batch reruns.
         """
         total = 0
         done = 0
@@ -188,9 +200,9 @@ class TranslationService:
             segments = store.load_chapter(ci).text_segments
             total += len(segments)
             for batch in _resume_batches(
-                segments, self._runtime.config.segment.max_chars_per_batch
+                segments, self._runtime.config.segment.max_tokens_per_batch
             ):
-                if all(segment.target and segment.target.strip() for segment in batch):
+                if all(segment.target is not None for segment in batch):
                     done += len(batch)
         return total, done
 
@@ -209,6 +221,7 @@ class TranslationService:
         progress: ProgressFn | None = None,
         done: int = 0,
         total: int = 0,
+        allow_empty_translations: bool = False,
     ) -> int:
         """Translate, polish, extract and persist one chapter; return the updated
         completed-paragraph count.
@@ -225,7 +238,7 @@ class TranslationService:
             annotation_context_registry,
         )
 
-        batches = _resume_batches(text_segs, self._runtime.config.segment.max_chars_per_batch)
+        batches = _resume_batches(text_segs, self._runtime.config.segment.max_tokens_per_batch)
         label = self.chapter_progress_label(chapter.title, ci)
         # Preparation often ends with a parsing label, but resume may first restore glossary terms.
         # Refresh at chapter start so the whole model call is not incorrectly labeled as source parsing.
@@ -246,9 +259,9 @@ class TranslationService:
         for b in batches:
             batch_start = seg_base
             glossary_key = store.batch_glossary_key(batch_start, len(b))
-            existing_targets = [s.target for s in b if s.target and s.target.strip()]
-            if len(existing_targets) == len(b):
+            if all(s.target is not None for s in b):
                 # Reuse a batch translated at this position/context, rebuild rolling context and skip it.
+                # Blank "" is a completed MinerU allowance; only None means not yet translated.
                 self._annotations.align_annotations_after_batch(
                     ci,
                     chapter,
@@ -312,6 +325,9 @@ class TranslationService:
                 term_snapshot_stale = False
 
             ctx_text = context.render(self._runtime.config.pipeline.rolling_context_segments)
+            next_index = batch_start + len(b)
+            # Read the immediate source neighbor without changing batches or saved context.
+            next_source = text_segs[next_index].source if next_index < len(text_segs) else ""
             targets = self.process_batch(
                 b,
                 term_snapshot,
@@ -320,6 +336,8 @@ class TranslationService:
                 book_synopsis,
                 chapter_digest,
                 annotation_contexts=annotation_contexts[batch_start : batch_start + len(b)],
+                next_source=next_source,
+                allow_empty_translations=allow_empty_translations,
             )
             for s, t in zip(b, targets):
                 s.target = t
@@ -474,7 +492,7 @@ class TranslationService:
         sees current formal text.
         """
         prefix = segments[: max(0, min(end, len(segments)))]
-        if not prefix or any(not (segment.target and segment.target.strip()) for segment in prefix):
+        if not prefix or any(segment.target is None for segment in prefix):
             return
         targets = [segment.target or "" for segment in prefix]
         retained = min(len(targets), len(context.recent_targets))
@@ -677,13 +695,13 @@ class TranslationService:
         glossary_text = prompts.render_glossary(glossary.all_terms())
         for batch_index, batch in enumerate(batches):
             titles = [str(item["source"]) for item in batch]
-            system = prompts.render(
+            system = render(
                 "title_translator_system",
                 src=self._runtime.config.source_lang,
                 tgt=self._runtime.config.target_lang,
                 n=len(titles),
             )
-            user = prompts.render(
+            user = render(
                 "title_translator_user",
                 src=self._runtime.config.source_lang,
                 tgt=self._runtime.config.target_lang,
@@ -697,8 +715,7 @@ class TranslationService:
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
                     ],
-                    tier="strong",
-                    stage="title_translate",
+                    operation="translation.title",
                 )
             except Exception as error:
                 store.log_event(
@@ -750,6 +767,9 @@ class TranslationService:
         book_synopsis: str = "",
         chapter_digest: str = "",
         annotation_contexts: list[list[dict[str, str]]] | None = None,
+        next_source: str = "",
+        *,
+        allow_empty_translations: bool = False,
     ) -> list[str]:
         """Translate then polish one batch.
         Translate every paragraph in its own context without reusing text across positions.
@@ -758,7 +778,8 @@ class TranslationService:
         whole-book translation, not inside each batch.
         """
         sources = [s.source for s in batch]
-        targets = self._runtime.translator.translate_batch(
+        translator = self._runtime.translator
+        targets = translator.translate_batch(
             sources,
             glossary_terms=terms,
             style=style,
@@ -766,6 +787,8 @@ class TranslationService:
             book_synopsis=book_synopsis,
             chapter_digest=chapter_digest,
             annotation_contexts=annotation_contexts,
+            next_source=next_source,
+            allow_empty_translations=allow_empty_translations,
         )
         # Strip pronunciation markers accidentally copied from source into the model's translation.
         targets = [strip_ruby_markers(target) for target in targets]
@@ -773,7 +796,24 @@ class TranslationService:
         if self._runtime.config.pipeline.polish:
             for segment, target in zip(batch, targets):
                 segment.target_before_polish = target
-            polished = self._runtime.polisher.polish(targets, glossary_terms=terms, style=style)
+            turn = translator.last_batch_turn
+            indices = translator.last_batch_indices
+            polished: list[str] | None = None
+            if turn is not None and indices is not None:
+                # Continue the translation conversation so shared prefixes stay cacheable.
+                continued = self._runtime.polisher.polish_continue(
+                    turn,
+                    n=len(indices),
+                    next_source=next_source,
+                )
+                if continued is not None and len(continued) == len(indices):
+                    polished = list(targets)
+                    for index, text in zip(indices, continued):
+                        polished[index] = strip_ruby_markers(text)
+            if polished is None:
+                polished = self._runtime.polisher.polish(
+                    targets, glossary_terms=terms, style=style, next_source=next_source
+                )
             if len(polished) == len(targets):
                 targets = polished
         else:
